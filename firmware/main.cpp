@@ -1,42 +1,56 @@
-#include <Arduino.h> // Compatible with STM32duino environment
+#include <Arduino.h>
 
-// -------------------------------------------------------------------
-// Pin & Configuration Constants
-// -------------------------------------------------------------------
-const int VOLTAGE_PIN = PA0;      // Precision Voltage Transformer Analog input
-const int CURRENT_PIN = PA1;      // Precision Current Transformer Analog input
+// --- Pin Definitions ---
+const int VOLTAGE_PIN = PA0;      // ZMPT101B Analog input
+const int CURRENT_PIN = PA1;      // ACS712 Analog input
 const int STATUS_LED  = PC13;     // Onboard STM32 Status Indicator
 
-const unsigned int SAMPLE_WINDOW = 200; // Sample over 200ms (10 full AC cycles at 50Hz)
-const float V_CALIBRATION = 240.0 / 1.5; // Scale factor for voltage channel
-const float I_CALIBRATION = 10.0 / 1.0;  // Scale factor for current channel
+// --- Sampling Configurations ---
+const unsigned int SAMPLE_WINDOW = 200; 
+const float V_CALIBRATION = 240.0 / 1.5; 
+const float I_CALIBRATION = 10.0 / 1.0;  
 
-// -------------------------------------------------------------------
-// Telemetry & NILM Calibration Variables
-// -------------------------------------------------------------------
+// --- Global Telemetry Variables ---
 float V_rms = 0.0, I_rms = 0.0;
 float activePower = 0.0, apparentPower = 0.0, powerFactor = 0.0;
 float lastActivePower = 0.0;
 unsigned long lastTelemetryTime = 0;
 
-// Simplified NILM Baseline Signatures (Steady-State Active Power Steps in Watts)
-const float SIGNATURE_REFRIGERATOR = 150.0;
-const float SIGNATURE_MICROWAVE    = 800.0;
-const float SIGNATURE_LIGHTING     = 40.0;
-const float NILM_THRESHOLD         = 25.0; // Margin of error for step detection
+// --- Dynamic NILM Storage Framework ---
+struct Appliance {
+    char name[16];
+    float powerRating;
+    bool isActive;
+};
 
-void executeNILMEngine(float powerDelta);
+// Provision to hold up to 10 user-defined dashboard appliances
+Appliance userAppliances[10];
+int totalApplianceCount = 0;
+const float NILM_THRESHOLD = 25.0; // Minimum delta to trigger scan
+
+// --- Function Prototypes ---
+void executeDynamicNILM(float powerDelta);
+void checkIncomingDashboardConfigs();
 
 void setup() {
-    Serial.begin(115200); // UART Link out to MQTT Network Module (e.g., ESP8266)
+    Serial.begin(115200); // UART Serial Link linking to ESP8266 Gateway
+    
     pinMode(VOLTAGE_PIN, INPUT);
     pinMode(CURRENT_PIN, INPUT);
     pinMode(STATUS_LED, OUTPUT);
+    digitalWrite(STATUS_LED, HIGH); 
     
-    digitalWrite(STATUS_LED, HIGH); // Initialization complete
+    // Seed default baseline profile into index slot 0
+    strcpy(userAppliances[0].name, "Base Load");
+    userAppliances[0].powerRating = 40.0;
+    userAppliances[0].isActive = false;
+    totalApplianceCount = 1;
 }
 
 void loop() {
+    // 1. Check for new dynamic equipment updates added via the user dashboard
+    checkIncomingDashboardConfigs();
+
     long sumVoltageSq = 0;
     long sumCurrentSq = 0;
     long sumInstantaneousPower = 0;
@@ -44,52 +58,39 @@ void loop() {
     
     unsigned long startTime = millis();
     
-    // ---------------------------------------------------------------
-    // 1. High-Frequency Analog Sampling Window
-    // ---------------------------------------------------------------
+    // 2. High-Frequency Waveform Integration
     while ((millis() - startTime) < SAMPLE_WINDOW) {
-        // Read raw 12-bit ADC data (Offset centered around VCC/2 internally)
         int rawV = analogRead(VOLTAGE_PIN) - 2048;
         int rawI = analogRead(CURRENT_PIN) - 2048;
         
         sumVoltageSq += ((long)rawV * rawV);
         sumCurrentSq += ((long)rawI * rawI);
         sumInstantaneousPower += ((long)rawV * rawI);
-        
         sampleCount++;
     }
     
-    // Prevent Division-by-Zero errors
     if (sampleCount == 0) return;
 
-    // ---------------------------------------------------------------
-    // 2. Continuous Power Metric Integration
-    // ---------------------------------------------------------------
     V_rms = sqrt(sumVoltageSq / sampleCount) * (3.3 / 4096.0) * V_CALIBRATION;
     I_rms = sqrt(sumCurrentSq / sampleCount) * (3.3 / 4096.0) * I_CALIBRATION;
     
     activePower = abs((float)sumInstantaneousPower / sampleCount * (3.3 / 4096.0) * (3.3 / 4096.0) * V_CALIBRATION * I_CALIBRATION);
     apparentPower = V_rms * I_rms;
-    powerFactor = (apparentPower > 0) ? (activePower / apparentPower) : 0.0;
     
+    powerFactor = (apparentPower > 0) ? (activePower / apparentPower) : 0.0;
     if (powerFactor > 1.0) powerFactor = 1.0;
 
-    // ---------------------------------------------------------------
-    // 3. Steady-State NILM Step Detection Engine
-    // ---------------------------------------------------------------
+    // 3. Process Transients Using Dynamically Added Signatures
     float powerDelta = activePower - lastActivePower;
     if (abs(powerDelta) >= NILM_THRESHOLD) {
-        executeNILMEngine(powerDelta);
-        lastActivePower = activePower; // Reset step baseline
+        executeDynamicNILM(powerDelta);
+        lastActivePower = activePower; 
     }
 
-    // ---------------------------------------------------------------
-    // 4. Low-Latency MQTT Telemetry Packaging (<50ms pipeline)
-    // ---------------------------------------------------------------
-    if (millis() - lastTelemetryTime >= 1000) { // Transmit data packet every second
-        digitalWrite(STATUS_LED, LOW); // Toggle activity LED
+    // 4. Dispatch System Stream Metrics Out to Dashboard Gateway (1 Hz)
+    if (millis() - lastTelemetryTime >= 1000) { 
+        digitalWrite(STATUS_LED, LOW); 
         
-        // Output cleanly formatted JSON string over UART link to MQTT gateway broker
         Serial.print("{\"V_rms\":"); Serial.print(V_rms, 2);
         Serial.print(",\"I_rms\":"); Serial.print(I_rms, 3);
         Serial.print(",\"ActivePower\":"); Serial.print(activePower, 2);
@@ -102,27 +103,60 @@ void loop() {
     }
 }
 
-// -------------------------------------------------------------------
-// Non-Intrusive Load Monitoring (NILM) Event Logic
-// -------------------------------------------------------------------
-void executeNILMEngine(float powerDelta) {
+// --- Parse Incoming Dashboard Instructions ---
+// Handles incoming string format: "ADD:DeviceName,Rating" 
+// Example string sent from cloud: "ADD:Microwave,800"
+void checkIncomingDashboardConfigs() {
+    if (Serial.available() > 0) {
+        String incomingStr = Serial.readStringUntil('\n');
+        incomingStr.trim();
+        
+        if (incomingStr.startsWith("ADD:") && totalApplianceCount < 10) {
+            int colonIdx = incomingStr.indexOf(':');
+            int commaIdx = incomingStr.indexOf(',');
+            
+            if (commaIdx > colonIdx) {
+                String devName = incomingStr.substring(colonIdx + 1, commaIdx);
+                String devRating = incomingStr.substring(commaIdx + 1);
+                
+                // Add the user payload definition directly into local search profiles
+                devName.toCharArray(userAppliances[totalApplianceCount].name, 16);
+                userAppliances[totalApplianceCount].powerRating = devRating.toFloat();
+                userAppliances[totalApplianceCount].isActive = false;
+                
+                totalApplianceCount++;
+            }
+        }
+    }
+}
+
+// --- Dynamic Matching Execution Engine ---
+void executeDynamicNILM(float powerDelta) {
     bool isEdgePositive = (powerDelta > 0);
     float absoluteDelta = abs(powerDelta);
-    String targetDevice = "Unknown Appliance";
+    int matchedIndex = -1;
+    float closestTolerance = 99999.0;
     
-    // Classify step delta against known appliance profiles
-    if (abs(absoluteDelta - SIGNATURE_MICROWAVE) <= 75.0) {
-        targetDevice = "Microwave Ovens";
-    } else if (abs(absoluteDelta - SIGNATURE_REFRIGERATOR) <= 35.0) {
-        targetDevice = "Refrigerator Unit";
-    } else if (abs(absoluteDelta - SIGNATURE_LIGHTING) <= 10.0) {
-        targetDevice = "Lighting Arrays";
-    } else {
-        return; // Filter out negligible load noise
+    // Cycle through array configurations up to the current total counter metric limit
+    for (int i = 0; i < totalApplianceCount; i++) {
+        float difference = abs(absoluteDelta - userAppliances[i].powerRating);
+        
+        // Dynamic adaptive window scaling depending on magnitude size
+        float calculatedToleranceWindow = userAppliances[i].powerRating * 0.15; 
+        if (calculatedToleranceWindow < 15.0) calculatedToleranceWindow = 15.0; 
+        
+        if (difference <= calculatedToleranceWindow && difference < closestTolerance) {
+            closestTolerance = difference;
+            matchedIndex = i;
+        }
     }
     
-    // Print isolated NILM event output to stream to specific cloud topic
-    Serial.print("NILM_EVENT -> ");
-    Serial.print(targetDevice);
-    Serial.println(isEdgePositive ? " turned ON State." : " turned OFF State.");
+    // If a signature match matches the parameters, alert backend dashboard log channels
+    if (matchedIndex != -1) {
+        userAppliances[matchedIndex].isActive = isEdgePositive;
+        
+        Serial.print("{\"NILM_Event\":\"");
+        Serial.print(userAppliances[matchedIndex].name);
+        Serial.println(isEdgePositive ? "_ON\"}" : "_OFF\"}");
+    }
 }
