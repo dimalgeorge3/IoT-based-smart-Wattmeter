@@ -9,7 +9,7 @@ An advanced, edge-to-cloud smart energy metering framework that captures real-ti
 * **Cloud Telemetry Analytics:** Cloud dashboard hooks for tracking real-time active power ($P$), reactive power ($Q$), root-mean-square metrics ($V_{rms}$, $I_{rms}$), and power factor ($PF$).
 
 ## System Architecture
-![IoT Smart Wattmeter System Diagram](images/IOT%20based%20Wattmeter.png)
+![IoT Smart Wattmeter System Diagram](firmware/IOT%20based%20Wattmeter.png)
 1. **Hardware Layer:** Voltage and current transformers feed scaled analog signals to the STM32 ADC.
 2. **Firmware Layer:** The microcontroller computes active/apparent power and builds MQTT payloads.
 3. **Transport Layer:** An ESP8266/Wi-Fi or cellular bypass uses a lightweight MQTT broker to stream time-series metrics.
